@@ -1,0 +1,476 @@
+package com.rsf.controller;
+
+import com.rsf.domain.FileEntity;
+import com.rsf.domain.User;
+import com.rsf.repo.FileRepo;
+import com.rsf.repo.UserRepo;
+import com.rsf.service.StorageService;
+import com.rsf.rsf.config.RsfMappingConfig;
+import com.rsf.rsf.domain.models.FieldDefinition;
+import com.rsf.rsf.domain.validation.RsfError;
+import com.rsf.rsf.domain.validation.RsfValidationResult;
+import com.rsf.rsf.exception.RsfParsingException;
+import com.rsf.rsf.service.RsfParsingService;
+import com.rsf.rsf.service.RsfValidationService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.poi.ss.usermodel.*;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+import org.apache.poi.hssf.usermodel.HSSFWorkbook;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.Resource;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.text.SimpleDateFormat;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
+import java.util.zip.ZipInputStream;
+
+@RestController
+@RequestMapping("/api/v1/import")
+@Slf4j
+public class ImportController {
+    private static final Logger log = LoggerFactory.getLogger(ImportController.class);
+    private static final List<String> ALLOWED_EXTENSIONS = Arrays.asList("zip", "xls", "xlsx", "csv", "txt");
+    private static final DateTimeFormatter RSF_DATE_FORMATTER = DateTimeFormatter.ofPattern("ddMMyyyy");
+
+    private final StorageService storage;
+    private final UserRepo users;
+    private final FileRepo files;
+    private final RsfParsingService rsfParsingService;
+    private final RsfValidationService rsfValidationService;
+    private final RsfMappingConfig rsfMappingConfig;
+    
+    @Value("${file.storage-path:uploads}") 
+    private String storagePath;
+    
+    private final Map<String, Integer> importProgress = new ConcurrentHashMap<>();
+    private final Map<String, List<RsfError>> importRsfErrors = new ConcurrentHashMap<>();
+    private final Map<String, Map<String, Object>> importResults = new ConcurrentHashMap<>();
+    private final Map<String, ValidationResult> validationResults = new ConcurrentHashMap<>();
+    private final Map<String, List<String>> processedDataLines = new ConcurrentHashMap<>();
+
+    public ImportController(StorageService storage,
+                            UserRepo users,
+                            FileRepo files,
+                            RsfParsingService rsfParsingService, 
+                            RsfValidationService rsfValidationService,
+                            RsfMappingConfig rsfMappingConfig) {
+        this.storage = storage;
+        this.users = users;
+        this.files = files;
+        this.rsfParsingService = rsfParsingService;
+        this.rsfValidationService = rsfValidationService;
+        this.rsfMappingConfig = rsfMappingConfig;
+    }
+
+    @PostMapping("/upload")
+    public ResponseEntity<?> uploadFile(@RequestPart("file") MultipartFile file,
+                              @AuthenticationPrincipal UserDetails auth) {
+        try {
+            log.info("File upload request received: {}, size: {}", file.getOriginalFilename(), file.getSize());
+            
+            ValidationResult validationResult = validateFile(file);
+            if (!validationResult.isValid()) {
+                log.warn("File validation failed: {}", validationResult.getErrors());
+                return ResponseEntity.badRequest().body(Map.of(
+                    "success", false,
+                    "errors", validationResult.getErrors()
+                ));
+            }
+            
+            User uploader = null;
+            if (auth != null) {
+                uploader = users.findByUsername(auth.getUsername()).orElse(null);
+                log.info("Upload by user: {}", auth.getUsername() != null ? auth.getUsername() : "UNKNOWN");
+            } else {
+                log.info("Anonymous upload (no authentication)");
+            }
+            
+            FileEntity savedFile = storage.store(file, uploader);
+            final String fileId = savedFile.getId().toString();
+            log.info("File saved successfully with ID: {}", fileId);
+            
+            importProgress.put(fileId, 0);
+            importRsfErrors.put(fileId, new ArrayList<>());
+            validationResults.put(fileId, validationResult);
+            processedDataLines.put(fileId, new ArrayList<>());
+            importResults.put(fileId, new HashMap<>());
+            
+            new Thread(() -> processImportInBackground(fileId, file.getOriginalFilename(), savedFile)).start();
+            
+            return ResponseEntity.ok(Map.of(
+                "id", fileId,
+                "originalName", savedFile.getOriginalName(),
+                "storedName", savedFile.getStoredName(),
+                "type", savedFile.getType(),
+                "status", savedFile.getStatus().name(),
+                "uploadedAt", savedFile.getUploadedAt().toString(),
+                "uploader", savedFile.getUploader() != null ? savedFile.getUploader().getUsername() : null
+            ));
+        } catch (IOException e) {
+            log.error("Error storing uploaded file", e);
+            return ResponseEntity.internalServerError().body(Map.of("error", "File storage failed: " + e.getMessage()));
+        } catch (Exception e) {
+            log.error("Unexpected error during file upload", e);
+            return ResponseEntity.internalServerError().body(Map.of("error", "Unexpected error: " + e.getMessage()));
+        }
+    }
+    
+    @GetMapping("/progress/{fileId}")
+    public ResponseEntity<Map<String, Object>> getImportProgress(@PathVariable String fileId) {
+        log.debug("Getting progress for file: {}", fileId);
+        Integer progress = importProgress.get(fileId);
+        ValidationResult initialValidation = validationResults.get(fileId);
+
+        if (progress == null) {
+            log.warn("No progress found for file ID: {}", fileId);
+            if (importResults.containsKey(fileId) && !importResults.get(fileId).isEmpty()) {
+                 Map<String, Object> finalResults = importResults.get(fileId);
+                 finalResults.putIfAbsent("progress", 100);
+                 finalResults.putIfAbsent("complete", true); 
+                 return ResponseEntity.ok(finalResults);
+            }
+            return ResponseEntity.ok(Map.of("progress", 0, "complete", false, "message", "Processing not started or file ID not found"));
+        }
+        
+        Map<String, Object> response = new HashMap<>();
+        response.put("fileId", fileId);
+        response.put("progress", progress);
+        response.put("complete", progress >= 100 || progress < 0);
+        
+        if (initialValidation != null) {
+            response.put("validation", Map.of(
+                 "valid", initialValidation.isValid(),
+                 "fileType", initialValidation.getFileType(),
+                 "details", initialValidation.getDetails()
+            ));
+        }
+        
+        return ResponseEntity.ok(response);
+    }
+    
+    @GetMapping("/results/{fileId}")
+    public ResponseEntity<Map<String, Object>> getImportResults(@PathVariable String fileId) {
+        log.debug("Getting results for file: {}", fileId);
+        Map<String, Object> results = importResults.get(fileId);
+        
+        if (results == null || results.isEmpty()) {
+            Integer progress = importProgress.get(fileId);
+             if (progress != null && progress < 100 && progress >= 0) {
+                 log.warn("Results requested but import still in progress for file ID: {}", fileId);
+                 return ResponseEntity.ok(Map.of("fileId", fileId, "status", "Processing", "message", "Import is still in progress.", "progress", progress));
+             } else if (progress != null && progress < 0) {
+                 log.warn("Results requested but import failed for file ID: {}", fileId);
+                  Map<String, Object> failureResult = importResults.getOrDefault(fileId, new HashMap<>());
+                 failureResult.putIfAbsent("status", "Failed");
+                 failureResult.putIfAbsent("error", "Processing failed. Check logs for details.");
+                 failureResult.put("fileId", fileId);
+                 return ResponseEntity.status(500).body(failureResult);
+             } else {
+            log.warn("No results found for file ID: {}", fileId);
+                 return ResponseEntity.status(404).body(Map.of("message", "Import results not found or process never started for this ID."));
+        }
+        }
+        
+         results.putIfAbsent("fileId", fileId);
+         results.putIfAbsent("status", "Unknown");
+        
+        return ResponseEntity.ok(results);
+    }
+    
+    @GetMapping("/validate/{fileId}")
+    public ResponseEntity<ValidationResult> getValidationResult(@PathVariable String fileId) {
+        log.debug("Getting validation results for file: {}", fileId);
+        if (!validationResults.containsKey(fileId)) {
+            log.warn("No validation results found for file ID: {}", fileId);
+            return ResponseEntity.notFound().build();
+        }
+        
+        return ResponseEntity.ok(validationResults.get(fileId));
+    }
+    
+    @GetMapping("/status")
+    public ResponseEntity<Map<String, String>> getStatus() {
+        return ResponseEntity.ok(Map.of("status", "Import service is running"));
+    }
+    
+    private ValidationResult validateFile(MultipartFile file) {
+        ValidationResult result = new ValidationResult();
+        String originalFilename = file.getOriginalFilename();
+        
+        if (file.isEmpty()) {
+            result.addError("The file is empty");
+            result.setValid(false); return result;
+        }
+        if (file.getSize() > 70 * 1024 * 1024) { 
+            result.addError("File size exceeds maximum limit (70MB)");
+             result.setValid(false); return result;
+        }
+        if (originalFilename == null || originalFilename.isBlank() || !originalFilename.contains(".")) {
+             result.addError("Invalid or missing filename/extension");
+             result.setValid(false); return result;
+        }
+            
+            String extension = originalFilename.substring(originalFilename.lastIndexOf(".") + 1).toLowerCase();
+            result.setFileType(extension);
+            
+            if (!ALLOWED_EXTENSIONS.contains(extension)) {
+                result.addError("Invalid file format. Allowed formats: " + String.join(", ", ALLOWED_EXTENSIONS));
+             result.setValid(false); return result;
+            }
+            
+            if ("zip".equals(extension)) {
+            result.addDetail("ZIP file detected - will attempt extraction");
+            } else if ("xls".equals(extension) || "xlsx".equals(extension)) {
+            result.addDetail("Excel file detected");
+            } else if ("csv".equals(extension)) {
+            result.addDetail("CSV file detected");
+        } else if ("txt".equals(extension)) {
+             result.addDetail("Text file detected");
+             if (originalFilename.startsWith("RSF_")) {
+                  result.addDetail("RSF file naming convention detected");
+             }
+        }
+        
+        result.setValid(true);
+        return result;
+    }
+    
+    private void processImportInBackground(String fileId, String filename, FileEntity fileEntity) {
+        Map<String, Object> currentResults = new HashMap<>();
+        currentResults.put("filename", filename);
+        currentResults.put("fileId", fileId);
+        importResults.put(fileId, currentResults);
+
+        try {
+            importProgress.put(fileId, 5);
+            addValidationDetail(fileId, "Starting background processing...");
+            
+            boolean isRsf = filename != null && filename.startsWith("RSF_");
+            String extension = filename != null && filename.contains(".") ? 
+                               filename.substring(filename.lastIndexOf(".") + 1).toLowerCase() : "";
+
+            int year = 2017;
+
+            importProgress.put(fileId, 10);
+
+            if (isRsf) {
+                addValidationDetail(fileId, "Processing as RSF file...");
+                log.info("Processing file ID {} as RSF ({})", fileId, filename);
+
+                try (InputStream inputStream = getInputStreamForProcessing(fileId, filename, extension)) {
+                    importProgress.put(fileId, 20);
+                    
+                    addValidationDetail(fileId, "Parsing RSF structure...");
+                    Map<Character, List<Map<String, String>>> parsedData = rsfParsingService.parseRsfFile(inputStream, year);
+                    log.info("File ID {}: Parsed {} line types.", fileId, parsedData.size());
+                    importProgress.put(fileId, 50);
+
+                    addValidationDetail(fileId, "Validating RSF data rules...");
+                    RsfValidationResult validationResult = rsfValidationService.validateRsfData(parsedData);
+                    log.info("File ID {}: Validation complete. Found {} errors.", fileId, validationResult.getErrorCount());
+                    importRsfErrors.put(fileId, validationResult.getErrors());
+                    importProgress.put(fileId, 80);
+
+                    addValidationDetail(fileId, "Calculating statistics...");
+                    Map<Character, Long> lineCounts = parsedData.entrySet().stream()
+                            .collect(Collectors.toMap(Map.Entry::getKey, e -> (long)e.getValue().size()));
+                    long totalLines = lineCounts.values().stream().mapToLong(Long::longValue).sum();
+                    String firstDate = findDateSoins(parsedData, true);
+                    String lastDate = findDateSoins(parsedData, false);
+                    List<Map<String, Object>> mapping = getMappingForJson(year);
+
+                    currentResults.put("totalLines", totalLines);
+                    currentResults.put("lineTypeCounts", lineCounts);
+                    currentResults.put("errorCount", validationResult.getErrorCount());
+                    currentResults.put("firstDateSoins", firstDate);
+                    currentResults.put("lastDateSoins", lastDate);
+                    currentResults.put("rsfMapping", mapping);
+                    currentResults.put("rsfErrors", convertRsfErrorsForJson(validationResult.getErrors()));
+                    currentResults.put("recordsProcessed", totalLines);
+                    currentResults.put("status", validationResult.hasErrors() ? "Completed with Errors" : "Completed");
+
+                } catch (RsfParsingException e) {
+                    log.error("RSF Parsing failed for file ID {}: {}", fileId, e.getMessage());
+                    throw new IOException("RSF Parsing failed: " + e.getMessage(), e);
+                } catch (Exception e) {
+                     log.error("RSF Validation or Stat Calculation failed for file ID {}: {}", fileId, e.getMessage(), e);
+                    throw new IOException("RSF post-parsing processing failed: " + e.getMessage(), e);
+                }
+
+            } else {
+                addValidationDetail(fileId, "Processing as generic file ("+ extension +")...");
+                log.info("Processing file ID {} as Generic ({})", fileId, filename);
+                int recordCount = 0;
+                List<String> sampleLines = new ArrayList<>();
+                 try (InputStream is = getInputStreamForProcessing(fileId, filename, extension);
+                      BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
+                     String line;
+                     while ((line = reader.readLine()) != null) {
+                         recordCount++;
+                         if (sampleLines.size() < 5) {
+                              sampleLines.add(line);
+            }
+                         if (recordCount % 100 == 0) importProgress.put(fileId, 10 + (int)((float)recordCount / 1000 * 80));
+                     }
+                 }
+                 processedDataLines.put(fileId, sampleLines);
+                 currentResults.put("recordsProcessed", recordCount);
+                 currentResults.put("status", "Completed");
+            }
+
+            importProgress.put(fileId, 95);
+            currentResults.put("processedAt", new Date());
+            ValidationResult initialValidation = validationResults.get(fileId);
+             if (initialValidation != null) {
+                  currentResults.put("validationDetails", initialValidation.getDetails());
+             }
+             currentResults.put("processedRecords", processedDataLines.get(fileId)); 
+
+            importProgress.put(fileId, 100);
+            log.info("Import processing finished successfully for file ID: {}", fileId);
+
+        } catch (Exception e) {
+            log.error("Unhandled error processing import for file ID: {}", fileId, e);
+            importProgress.put(fileId, -1);
+            currentResults.put("status", "Failed");
+            currentResults.put("error", "Processing failed: " + e.getMessage());
+             if (!importRsfErrors.getOrDefault(fileId, Collections.emptyList()).isEmpty()) {
+                  currentResults.put("rsfErrors", convertRsfErrorsForJson(importRsfErrors.get(fileId)));
+                  currentResults.putIfAbsent("errorCount", importRsfErrors.get(fileId).size());
+             }
+        } finally {
+             importResults.put(fileId, currentResults);
+        }
+    }
+    
+    private InputStream getInputStreamForProcessing(String fileId, String filename, String extension) throws IOException {
+        Resource fileResource = storage.load(UUID.fromString(fileId));
+
+        if ("zip".equals(extension)) {
+            log.debug("Extracting TXT stream from ZIP file: {}", filename);
+            File zipFile = fileResource.getFile();
+            try (ZipInputStream zis = new ZipInputStream(Files.newInputStream(zipFile.toPath()))) {
+                ZipEntry zipEntry = zis.getNextEntry();
+                while (zipEntry != null) {
+                    if (!zipEntry.isDirectory() && zipEntry.getName().toLowerCase().endsWith(".txt")) {
+                        log.info("Found TXT entry '{}' in ZIP for processing.", zipEntry.getName());
+                        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                        zis.transferTo(baos);
+                        zis.closeEntry();
+                        return new ByteArrayInputStream(baos.toByteArray());
+                    }
+                    zis.closeEntry();
+                    zipEntry = zis.getNextEntry();
+                }
+            }
+            throw new IOException("No .txt file found inside the ZIP archive: " + filename);
+        } else {
+            return fileResource.getInputStream();
+                    }
+                }
+                
+    private String findDateSoins(Map<Character, List<Map<String, String>>> parsedData, boolean findFirst) {
+        LocalDate foundDate = null;
+        String dateField = "DATE_SOINS";
+
+        for (char lineType : new char[]{'B', 'C', 'M'}) {
+            if (parsedData.containsKey(lineType)) {
+                for (Map<String, String> lineData : parsedData.get(lineType)) {
+                    String dateStr = lineData.get(dateField);
+                    if (dateStr != null && !dateStr.isBlank()) {
+                        try {
+                            LocalDate currentDate = LocalDate.parse(dateStr.trim(), RSF_DATE_FORMATTER);
+                            if (foundDate == null || (findFirst && currentDate.isBefore(foundDate)) || (!findFirst && currentDate.isAfter(foundDate))) {
+                                foundDate = currentDate;
+                            }
+                        } catch (DateTimeParseException e) {
+                            log.warn("Could not parse date '{}' in line type {} for field {}", dateStr, lineType, dateField);
+                        }
+                    }
+                }
+            }
+        }
+        return foundDate != null ? foundDate.format(RSF_DATE_FORMATTER) : null;
+    }
+
+    private List<Map<String, Object>> getMappingForJson(int year) {
+        Map<Character, List<FieldDefinition>> yearMapping = rsfMappingConfig.rsfFieldMappings().get(year);
+        if (yearMapping == null) {
+            return Collections.emptyList();
+        }
+
+        List<Map<String, Object>> mappingList = new ArrayList<>();
+        yearMapping.forEach((lineType, fieldDefs) -> {
+            fieldDefs.forEach(def -> {
+                Map<String, Object> fieldMap = new HashMap<>();
+                fieldMap.put("lineType", String.valueOf(lineType));
+                fieldMap.put("fieldName", "Field_" + def.getStartIndex() + "_to_" + def.getEndIndex());
+                fieldMap.put("startIndex", def.getStartIndex());
+                fieldMap.put("endIndex", def.getEndIndex());
+                int length = def.getEndIndex() - def.getStartIndex();
+                fieldMap.put("length", length);
+                mappingList.add(fieldMap);
+            });
+        });
+         mappingList.sort(Comparator.comparing((Map<String, Object> m) -> (String) m.get("lineType"))
+                                   .thenComparing(m -> (Integer) m.get("startIndex")));
+        return mappingList;
+    }
+    
+    private List<Map<String, Object>> convertRsfErrorsForJson(List<RsfError> errors) {
+         if (errors == null || errors.isEmpty()) {
+             return Collections.emptyList();
+         }
+         return errors.stream().map(error -> {
+             Map<String, Object> map = new HashMap<>();
+             map.put("lineNumber", error.getLineNumber());
+             map.put("field", error.getField());
+             map.put("errorType", error.getErrorType() != null ? error.getErrorType().name() : "UNKNOWN");
+             map.put("message", error.getMessage());
+             map.put("lineContent", error.getLineContent());
+             return map;
+         }).collect(Collectors.toList());
+    }
+    
+    private void addValidationDetail(String fileId, String detail) {
+        ValidationResult validation = validationResults.get(fileId);
+        if (validation != null) {
+        validation.addDetail(detail);
+        } else {
+             log.warn("Attempted to add validation detail for unknown fileId: {}", fileId);
+        }
+    }
+    
+    public static class ValidationResult {
+        private boolean valid = false;
+        private String fileType = "unknown";
+        private final List<String> errors = new ArrayList<>();
+        private final List<String> details = new ArrayList<>();
+        
+        public boolean isValid() { return valid; }
+        public void setValid(boolean valid) { this.valid = valid; }
+        public List<String> getErrors() { return errors; }
+        public void addError(String error) { this.errors.add(error); }
+        public List<String> getDetails() { return details; }
+        public void addDetail(String detail) { this.details.add(detail); }
+        public String getFileType() { return fileType; }
+        public void setFileType(String fileType) { this.fileType = fileType; }
+    }
+} 
